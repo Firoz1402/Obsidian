@@ -1,0 +1,177 @@
+name: obsidian-prod
+
+services:
+  api:
+    container_name: obsidian-api-prod
+    image: obsidian/api:prod
+    build:
+      context: ./app_management_microservice
+      target: production
+    env_file:
+      - .env.prod
+    networks:
+      - obsidian-prod-internal
+      - web
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.obsidian-api-prod.rule=Host(`api.obsidian.com`)"
+      - "traefik.http.routers.obsidian-api-prod.entrypoints=websecure"
+      - "traefik.http.routers.obsidian-api-prod.tls=true"
+      - "traefik.http.routers.obsidian-api-prod.tls.certresolver=le"
+      - "traefik.http.services.obsidian-api-prod.loadbalancer.server.port=4000"
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    container_name: obsidian-redis-prod
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+      - --save
+      - "900 1"
+    networks:
+      - obsidian-prod-internal
+    volumes:
+      - obsidian-prod-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal-postgres:
+    container_name: obsidian-temporal-postgres-prod
+    image: postgres:16-alpine
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_USER: ${TEMPORAL_POSTGRES_USER:-temporal}
+      POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?TEMPORAL_POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: temporal
+    networks:
+      - obsidian-prod-temporal
+    volumes:
+      - obsidian-prod-temporal-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEMPORAL_POSTGRES_USER:-temporal} -d temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal:
+    container_name: obsidian-temporal-prod
+    image: temporalio/auto-setup:latest
+    env_file:
+      - .env.prod
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${TEMPORAL_POSTGRES_USER:-temporal}
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?TEMPORAL_POSTGRES_PASSWORD must be set}
+      POSTGRES_SEEDS: temporal-postgres
+      DEFAULT_NAMESPACE: ${TEMPORAL_NAMESPACE:-obsidian}
+      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_RETENTION:-168h}
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/production.yaml
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+      BIND_ON_IP: 0.0.0.0
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    networks:
+      - obsidian-prod-internal
+      - obsidian-prod-temporal
+    volumes:
+      - ./temporal/config/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal-ui:
+    container_name: obsidian-temporal-ui-prod
+    image: temporalio/ui:latest
+    env_file:
+      - .env.prod
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: ${TEMPORAL_UI_CORS_ORIGINS:-http://localhost:8080}
+      TEMPORAL_UI_PORT: 8080
+      TEMPORAL_UI_PUBLIC_PATH: ""
+      TEMPORAL_AUTH_ENABLED: ${TEMPORAL_AUTH_ENABLED:-false}
+    # Not publicly exposed: no Traefik labels, no `web` network, no port
+    # mapping. Reachable only from inside the obsidian-prod-internal
+    # network or via `docker exec` / `docker compose port temporal-ui 8080`
+    # / an SSH tunnel when debugging.
+    networks:
+      - obsidian-prod-internal
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  workflow-worker:
+    container_name: obsidian-workflow-worker-prod
+    image: obsidian/workflow-worker:prod
+    build:
+      context: ./workflow_microservice
+    env_file:
+      - .env.prod
+    environment:
+      OTEL_SERVICE_NAME_BASE: "obsidian-workflow"
+    networks:
+      - obsidian-prod-internal
+      - web
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  web:
+    external: true
+  obsidian-prod-internal:
+    name: obsidian-prod-internal
+    driver: bridge
+    internal: true
+  obsidian-prod-temporal:
+    name: obsidian-prod-temporal
+    driver: bridge
+    internal: true
+
+volumes:
+  obsidian-prod-redis-data:
+    name: obsidian-prod-redis-data
+  obsidian-prod-temporal-postgres-data:
+    name: obsidian-prod-temporal-postgres-data

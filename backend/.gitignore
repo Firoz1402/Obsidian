@@ -1,0 +1,31 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Tooling caches ───────────────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ── Temporal local runtime data (compose volumes / bind mounts) ──────────────
+temporal/data/
+temporal/postgres/
+temporal/certs/*
+!temporal/certs/.gitkeep
+
+# ── Credentials mounted into containers ──────────────────────────────────────
+firebase-service-account*.json

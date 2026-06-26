@@ -1,0 +1,171 @@
+name: obsidian-dev
+
+services:
+  api:
+    container_name: obsidian-api-dev
+    image: obsidian/api:dev
+    build:
+      context: ./app_management_microservice
+      target: development
+    env_file:
+      - ./.env.dev
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./app_management_microservice:/app
+    networks:
+      - obsidian-dev-internal
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    container_name: obsidian-redis-dev
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+      - --save
+      - "900 1"
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - obsidian-dev-internal
+    volumes:
+      - obsidian-dev-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal-postgres:
+    container_name: obsidian-temporal-postgres-dev
+    image: postgres:16-alpine
+    env_file:
+      - .env.dev
+    environment:
+      POSTGRES_USER: ${TEMPORAL_POSTGRES_USER:-temporal}
+      POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:-temporal_dev_password}
+      POSTGRES_DB: temporal
+    networks:
+      - obsidian-dev-temporal
+    volumes:
+      - obsidian-dev-temporal-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEMPORAL_POSTGRES_USER:-temporal} -d temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal:
+    container_name: obsidian-temporal-dev
+    image: temporalio/auto-setup:latest
+    env_file:
+      - .env.dev
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${TEMPORAL_POSTGRES_USER:-temporal}
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:-temporal_dev_password}
+      POSTGRES_SEEDS: temporal-postgres
+      DEFAULT_NAMESPACE: ${TEMPORAL_NAMESPACE:-obsidian}
+      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_RETENTION:-168h}
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/production.yaml
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+      BIND_ON_IP: 0.0.0.0
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    networks:
+      - obsidian-dev-internal
+      - obsidian-dev-temporal
+    volumes:
+      - ./temporal/config/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  temporal-ui:
+    container_name: obsidian-temporal-ui-dev
+    image: temporalio/ui:latest
+    env_file:
+      - .env.dev
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: ${TEMPORAL_UI_CORS_ORIGINS:-http://localhost:8233}
+      TEMPORAL_UI_PORT: 8080
+      TEMPORAL_UI_PUBLIC_PATH: ""
+      TEMPORAL_AUTH_ENABLED: ${TEMPORAL_AUTH_ENABLED:-false}
+    ports:
+      - "127.0.0.1:8233:8080"
+    networks:
+      - obsidian-dev-internal
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  workflow-worker:
+    container_name: obsidian-workflow-worker-dev
+    image: obsidian/workflow-worker:dev
+    build:
+      context: ./workflow_microservice
+    env_file:
+      - ./.env.dev
+    environment:
+      # Overrides OTEL_SERVICE_NAME_BASE from .env.dev so each worker reports
+      # its own service.name in Grafana/OTel instead of all four collapsing
+      # into "obsidian-app-management-*".
+      OTEL_SERVICE_NAME_BASE: "obsidian-workflow"
+    ports:
+      - "127.0.0.1:8100:8100"
+    networks:
+      - obsidian-dev-internal
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  obsidian-dev-internal:
+    name: obsidian-dev-internal
+    driver: bridge
+  obsidian-dev-temporal:
+    name: obsidian-dev-temporal
+    driver: bridge
+    internal: true
+
+volumes:
+  obsidian-dev-redis-data:
+    name: obsidian-dev-redis-data
+  obsidian-dev-temporal-postgres-data:
+    name: obsidian-dev-temporal-postgres-data

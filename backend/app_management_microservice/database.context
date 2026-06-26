@@ -1,0 +1,572 @@
+-- ============================================================================
+-- Obsidian — Autonomous Earth Intelligence Platform
+-- Supabase / PostgreSQL schema (PostGIS-enabled)
+--
+-- Run top-to-bottom in the Supabase SQL editor (or as migration 0001) to build
+-- the database from scratch. Geometry is stored in EPSG:4326 (WGS84); original
+-- GeoJSON is retained alongside geometry for lossless frontend round-tripping.
+--
+-- Authorization is enforced in the API service layer (backend-issued JWT +
+-- Supabase service-role key). RLS is enabled to deny direct anon/public access;
+-- see the RLS section at the bottom.
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- Extensions
+-- ----------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pgcrypto;        -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS postgis;         -- geometry / geography, polygons
+CREATE EXTENSION IF NOT EXISTS postgis_raster;  -- raster footprints / index tiles
+CREATE EXTENSION IF NOT EXISTS pg_trgm;         -- fuzzy text search on names
+
+-- ----------------------------------------------------------------------------
+-- Shared trigger: maintain updated_at
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- Enumerated types
+-- ----------------------------------------------------------------------------
+CREATE TYPE public.auth_provider AS ENUM ('google');
+
+CREATE TYPE public.investigation_status AS ENUM (
+    'draft', 'planning', 'planned', 'executing',
+    'completed', 'failed', 'cancelled'
+);
+
+CREATE TYPE public.stage_status AS ENUM (
+    'pending', 'running', 'completed', 'failed', 'skipped'
+);
+
+CREATE TYPE public.node_type AS ENUM (
+    'question', 'resolve_aoi', 'retrieve_imagery', 'cloud_filter',
+    'temporal_align', 'ai_analysis', 'gis_analysis', 'evidence',
+    'reasoning', 'report'
+);
+
+CREATE TYPE public.aoi_resolution_method AS ENUM (
+    'user_drawn', 'resolved_from_name', 'uploaded'
+);
+
+CREATE TYPE public.sensor_type AS ENUM (
+    'optical', 'sar', 'thermal', 'hyperspectral', 'lidar'
+);
+
+CREATE TYPE public.dataset_provider AS ENUM (
+    'google_earth_engine', 'copernicus', 'usgs', 'planet', 'maxar', 'other'
+);
+
+CREATE TYPE public.artifact_type AS ENUM (
+    'imagery', 'mask', 'segmentation', 'change_map', 'index_raster',
+    'vector', 'statistics', 'report', 'other'
+);
+
+CREATE TYPE public.report_format AS ENUM ('interactive', 'pdf', 'html', 'json');
+
+CREATE TYPE public.monitor_status AS ENUM ('active', 'paused', 'disabled');
+
+-- ============================================================================
+-- IDENTITY & AUTH  (Sign in with Google only; backend-issued JWT)
+-- ============================================================================
+
+-- Canonical user record. One row per person; the Google identity links in via
+-- auth_identities. email/first_name/last_name are sourced from the Google profile.
+CREATE TABLE public.users (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    legacy_id           text,
+    email               text UNIQUE,
+    first_name          text,
+    middle_name         text,
+    last_name           text,
+    mobile              text,
+    gender              text,
+    dob                 date,
+    profile_pic_path    text,                 -- Supabase Storage object path
+    is_email_verified   boolean NOT NULL DEFAULT false,
+    deleted_account     boolean NOT NULL DEFAULT false,
+    last_login_at       timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT users_gender_check CHECK (
+        gender IS NULL OR gender = ANY (ARRAY['male','female','other','prefer_not_to_say'])
+    )
+);
+
+-- Provider identities. Google only for now; UNIQUE(provider, provider_user_id)
+-- prevents the same Google account from linking to two users.
+CREATE TABLE public.auth_identities (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    provider            public.auth_provider NOT NULL,
+    provider_user_id    text NOT NULL,
+    email               text,
+    phone               text,
+    is_primary          boolean NOT NULL DEFAULT false,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT auth_identities_provider_uid_key UNIQUE (provider, provider_user_id)
+);
+
+CREATE INDEX auth_identities_user_id_idx ON public.auth_identities (user_id);
+
+-- Durable refresh-token records for rotation + revoke-all-devices. The hot path
+-- (single-token validation / blocklist) runs through Redis; this table is the
+-- system of record for audit and bulk revocation.
+CREATE TABLE public.auth_refresh_tokens (
+    jti                 uuid PRIMARY KEY,
+    user_id             uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    token_hash          text NOT NULL,
+    device              text,
+    user_agent          text,
+    ip_address          inet,
+    expires_at          timestamptz NOT NULL,
+    revoked_at          timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX auth_refresh_tokens_user_id_idx ON public.auth_refresh_tokens (user_id);
+
+-- ============================================================================
+-- PROJECTS  (workspaces that group investigations)
+-- ============================================================================
+CREATE TABLE public.projects (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id            uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name                text NOT NULL,
+    description         text,
+    is_archived         boolean NOT NULL DEFAULT false,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX projects_owner_id_idx ON public.projects (owner_id);
+
+-- Collaboration (Phase 3). Owner is implicit via projects.owner_id.
+CREATE TABLE public.project_members (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          uuid NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id             uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    role                text NOT NULL DEFAULT 'viewer'
+                        CHECK (role = ANY (ARRAY['editor','viewer'])),
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT project_members_unique UNIQUE (project_id, user_id)
+);
+
+-- ============================================================================
+-- CAPABILITY CATALOG  (planner reasons about capabilities, not models)
+-- ============================================================================
+
+-- Abstract capabilities the planner can compose (Retrieve Imagery, Segment
+-- Objects, Detect Changes, Compute NDVI, Compute Area, Generate Report).
+CREATE TABLE public.capabilities (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug                text NOT NULL UNIQUE,
+    name                text NOT NULL,
+    description         text,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- Concrete implementations that satisfy a capability (SAM2 / SAM3 / GeoSAM).
+-- The execution layer picks one; the planner never references these.
+CREATE TABLE public.capability_implementations (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    capability_id       uuid NOT NULL REFERENCES public.capabilities(id) ON DELETE CASCADE,
+    slug                text NOT NULL UNIQUE,
+    name                text NOT NULL,
+    version             text,
+    is_active           boolean NOT NULL DEFAULT true,
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX capability_impl_capability_id_idx
+    ON public.capability_implementations (capability_id);
+
+-- Reusable investigation templates (Urban Expansion, Coastline Analysis, ...).
+-- default_capabilities is the ordered capability plan the template compiles to.
+CREATE TABLE public.investigation_templates (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug                text NOT NULL UNIQUE,
+    name                text NOT NULL,
+    description         text,
+    default_capabilities jsonb NOT NULL DEFAULT '[]'::jsonb,
+    is_active           boolean NOT NULL DEFAULT true,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- SATELLITE DATASETS  (automatic dataset selection)
+-- ============================================================================
+CREATE TABLE public.satellite_datasets (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug                text NOT NULL UNIQUE,
+    name                text NOT NULL,
+    provider            public.dataset_provider NOT NULL,
+    sensor_type         public.sensor_type NOT NULL,
+    spatial_resolution_m numeric,
+    revisit_days        numeric,
+    bands               jsonb NOT NULL DEFAULT '[]'::jsonb,
+    earth_engine_id     text,                 -- e.g. COPERNICUS/S2_SR_HARMONIZED
+    description         text,
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    is_active           boolean NOT NULL DEFAULT true,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- INVESTIGATIONS  (the core unit; one durable Temporal workflow each)
+-- ============================================================================
+CREATE TABLE public.investigations (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          uuid REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id             uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    template_id         uuid REFERENCES public.investigation_templates(id) ON DELETE SET NULL,
+    title               text,
+    natural_language_query text NOT NULL,     -- the "Ask Obsidian..." prompt
+    detected_intent     text,                 -- planner's intent label
+    status              public.investigation_status NOT NULL DEFAULT 'draft',
+    temporal_workflow_id text,                -- Temporal correlation id
+    time_range_start    date,                 -- temporal analysis window
+    time_range_end      date,
+    confidence          numeric CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    error_code          text,
+    error_message       text,
+    started_at          timestamptz,
+    completed_at        timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX investigations_user_id_idx    ON public.investigations (user_id);
+CREATE INDEX investigations_project_id_idx ON public.investigations (project_id);
+CREATE INDEX investigations_status_idx     ON public.investigations (status);
+CREATE INDEX investigations_workflow_idx   ON public.investigations (temporal_workflow_id);
+
+-- ============================================================================
+-- AREAS OF INTEREST  (PostGIS; auto-resolved or user-drawn polygons)
+-- ============================================================================
+CREATE TABLE public.areas_of_interest (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    name                text,
+    resolution_method   public.aoi_resolution_method NOT NULL,
+    source_query        text,                 -- e.g. "Philippines"
+    geom                geometry(MultiPolygon, 4326) NOT NULL,
+    bbox                geometry(Polygon, 4326),
+    centroid            geometry(Point, 4326),
+    geojson             jsonb,                -- original GeoJSON, lossless
+    area_sq_km          numeric,
+    properties          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX areas_of_interest_investigation_idx ON public.areas_of_interest (investigation_id);
+CREATE INDEX areas_of_interest_geom_gix          ON public.areas_of_interest USING GIST (geom);
+CREATE INDEX areas_of_interest_centroid_gix      ON public.areas_of_interest USING GIST (centroid);
+
+-- Dataset choices made by the planner for an investigation, with reasoning.
+CREATE TABLE public.dataset_selections (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    dataset_id          uuid NOT NULL REFERENCES public.satellite_datasets(id),
+    selected_for        text,                 -- capability slug this serves
+    reason              text,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX dataset_selections_investigation_idx ON public.dataset_selections (investigation_id);
+
+-- ============================================================================
+-- EXPLAINABLE PLAN  (the checklist shown before execution)
+-- ============================================================================
+CREATE TABLE public.investigation_plan_steps (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    step_order          integer NOT NULL,
+    capability          text NOT NULL,        -- capability slug
+    title               text NOT NULL,
+    description         text,
+    reasoning           text,                 -- planner transparency
+    status              public.stage_status NOT NULL DEFAULT 'pending',
+    started_at          timestamptz,
+    completed_at        timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT plan_steps_unique_order UNIQUE (investigation_id, step_order)
+);
+
+CREATE INDEX plan_steps_investigation_idx ON public.investigation_plan_steps (investigation_id);
+
+-- ============================================================================
+-- INVESTIGATION GRAPH  (interactive nodes + edges, not a chat)
+-- ============================================================================
+CREATE TABLE public.investigation_nodes (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    node_key            text NOT NULL,        -- stable key within the graph
+    node_type           public.node_type NOT NULL,
+    label               text NOT NULL,
+    capability          text,
+    implementation      text,                 -- concrete impl that ran (SAM2...)
+    status              public.stage_status NOT NULL DEFAULT 'pending',
+    output_summary      jsonb NOT NULL DEFAULT '{}'::jsonb,
+    position            jsonb,                -- {x, y} for the UI layout
+    started_at          timestamptz,
+    completed_at        timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT investigation_nodes_unique_key UNIQUE (investigation_id, node_key)
+);
+
+CREATE INDEX investigation_nodes_investigation_idx ON public.investigation_nodes (investigation_id);
+
+CREATE TABLE public.investigation_edges (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    from_node_id        uuid NOT NULL REFERENCES public.investigation_nodes(id) ON DELETE CASCADE,
+    to_node_id          uuid NOT NULL REFERENCES public.investigation_nodes(id) ON DELETE CASCADE,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT investigation_edges_unique UNIQUE (from_node_id, to_node_id)
+);
+
+CREATE INDEX investigation_edges_investigation_idx ON public.investigation_edges (investigation_id);
+
+-- ============================================================================
+-- IMAGERY  (retrieved satellite scenes, with spatial footprints)
+-- ============================================================================
+CREATE TABLE public.imagery_scenes (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    dataset_id          uuid REFERENCES public.satellite_datasets(id),
+    provider_scene_id   text,                 -- provider's native scene id
+    acquired_at         timestamptz,
+    cloud_cover_pct     numeric,
+    footprint           geometry(Polygon, 4326),
+    storage_path        text,                 -- Supabase Storage object path
+    thumbnail_path      text,
+    bands               jsonb NOT NULL DEFAULT '[]'::jsonb,
+    is_cloud_filtered   boolean NOT NULL DEFAULT false,
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX imagery_scenes_investigation_idx ON public.imagery_scenes (investigation_id);
+CREATE INDEX imagery_scenes_acquired_idx      ON public.imagery_scenes (acquired_at);
+CREATE INDEX imagery_scenes_footprint_gix     ON public.imagery_scenes USING GIST (footprint);
+
+-- ============================================================================
+-- ARTIFACTS & EVIDENCE  (every artifact carries confidence + provenance)
+-- ============================================================================
+CREATE TABLE public.artifacts (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    node_id             uuid REFERENCES public.investigation_nodes(id) ON DELETE SET NULL,
+    artifact_type       public.artifact_type NOT NULL,
+    capability          text,
+    implementation      text,                 -- processing_method / model
+    storage_path        text,                 -- Supabase Storage object path
+    geom                geometry(Geometry, 4326),  -- vector outputs (any type)
+    geojson             jsonb,
+    statistics          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    confidence          numeric CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    source_dataset_id   uuid REFERENCES public.satellite_datasets(id),
+    produced_at         timestamptz NOT NULL DEFAULT now(),
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,  -- reason, params, ...
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX artifacts_investigation_idx ON public.artifacts (investigation_id);
+CREATE INDEX artifacts_node_idx          ON public.artifacts (node_id);
+CREATE INDEX artifacts_geom_gix          ON public.artifacts USING GIST (geom);
+
+-- Conclusions ("124 new buildings detected"), each traceable to evidence.
+CREATE TABLE public.findings (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    title               text NOT NULL,
+    description         text,
+    finding_type        text,
+    value               jsonb NOT NULL DEFAULT '{}'::jsonb,
+    confidence          numeric CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    geom                geometry(Geometry, 4326),
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX findings_investigation_idx ON public.findings (investigation_id);
+CREATE INDEX findings_geom_gix          ON public.findings USING GIST (geom);
+
+-- Many-to-many: which artifacts back which finding (the evidence trail).
+CREATE TABLE public.finding_evidence (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_id          uuid NOT NULL REFERENCES public.findings(id) ON DELETE CASCADE,
+    artifact_id         uuid NOT NULL REFERENCES public.artifacts(id) ON DELETE CASCADE,
+    note                text,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT finding_evidence_unique UNIQUE (finding_id, artifact_id)
+);
+
+-- ============================================================================
+-- REPORTS  (interactive + exportable)
+-- ============================================================================
+CREATE TABLE public.reports (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    title               text,
+    summary             text,
+    format              public.report_format NOT NULL DEFAULT 'interactive',
+    content             jsonb NOT NULL DEFAULT '{}'::jsonb,  -- interactive structure
+    storage_path        text,                 -- exported asset on Supabase Storage
+    generated_at        timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX reports_investigation_idx ON public.reports (investigation_id);
+
+-- ============================================================================
+-- TIMELINE & EVENT OUTBOX  (replayable timeline + SSE incremental updates)
+-- ============================================================================
+
+-- Replayable per-investigation timeline; users revisit any stage later.
+CREATE TABLE public.investigation_events (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    investigation_id    uuid NOT NULL REFERENCES public.investigations(id) ON DELETE CASCADE,
+    stage               text,                 -- question|planning|imagery|models|evidence|reasoning|report
+    event_type          text NOT NULL,
+    payload             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX investigation_events_investigation_idx
+    ON public.investigation_events (investigation_id, occurred_at);
+
+-- Transactional outbox. Workers write events here in the same txn as state
+-- changes; a relay forwards them to Redis streams which the API tails for SSE.
+CREATE TABLE public.event_outbox (
+    id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    aggregate_type      text NOT NULL,        -- e.g. 'investigation'
+    aggregate_id        uuid NOT NULL,
+    event_type          text NOT NULL,
+    payload             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    relayed_at          timestamptz
+);
+
+CREATE INDEX event_outbox_unrelayed_idx
+    ON public.event_outbox (created_at) WHERE relayed_at IS NULL;
+
+-- ============================================================================
+-- MONITORING  (Phase 2: scheduled / automated investigations)
+-- ============================================================================
+CREATE TABLE public.investigation_monitors (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          uuid NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id             uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    template_id         uuid REFERENCES public.investigation_templates(id) ON DELETE SET NULL,
+    name                text NOT NULL,
+    natural_language_query text NOT NULL,
+    aoi_geom            geometry(MultiPolygon, 4326),
+    cron_schedule       text NOT NULL,        -- driven by a Temporal Schedule
+    status              public.monitor_status NOT NULL DEFAULT 'active',
+    last_run_at         timestamptz,
+    next_run_at         timestamptz,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX investigation_monitors_project_idx ON public.investigation_monitors (project_id);
+CREATE INDEX investigation_monitors_aoi_gix     ON public.investigation_monitors USING GIST (aoi_geom);
+
+-- ============================================================================
+-- updated_at triggers
+-- ============================================================================
+CREATE TRIGGER users_set_updated_at
+    BEFORE UPDATE ON public.users
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TRIGGER projects_set_updated_at
+    BEFORE UPDATE ON public.projects
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TRIGGER investigations_set_updated_at
+    BEFORE UPDATE ON public.investigations
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TRIGGER investigation_monitors_set_updated_at
+    BEFORE UPDATE ON public.investigation_monitors
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- ============================================================================
+-- ROW LEVEL SECURITY
+--
+-- The API uses the Supabase service-role key, which bypasses RLS; per-user
+-- authorization is enforced in the service layer against the backend-issued
+-- JWT. RLS is enabled here so that the anon/public keys cannot read or write
+-- these tables directly. Add auth.uid()-based policies only if/when the
+-- frontend is given direct (non-service-role) table access.
+-- ============================================================================
+ALTER TABLE public.users                    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.auth_identities          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.auth_refresh_tokens      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.projects                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.project_members          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.capabilities             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.capability_implementations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_templates  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.satellite_datasets       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigations           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.areas_of_interest        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.dataset_selections       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_plan_steps ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_nodes      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_edges      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imagery_scenes           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.artifacts                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.findings                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.finding_evidence         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reports                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_events     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.event_outbox             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.investigation_monitors   ENABLE ROW LEVEL SECURITY;
+
+-- ============================================================================
+-- SEED DATA  (capabilities, datasets, templates)
+-- ============================================================================
+INSERT INTO public.capabilities (slug, name, description) VALUES
+    ('resolve_aoi',      'Resolve AOI',       'Resolve a location or drawing into an area of interest polygon.'),
+    ('retrieve_imagery', 'Retrieve Imagery',  'Retrieve satellite scenes covering the AOI and time range.'),
+    ('cloud_filter',     'Cloud Filtering',   'Select cloud-free or cloud-masked imagery.'),
+    ('segment_objects',  'Segment Objects',   'Segment objects of interest from imagery.'),
+    ('detect_changes',   'Detect Changes',    'Detect temporal change between aligned scenes.'),
+    ('compute_ndvi',     'Compute NDVI',      'Compute vegetation indices.'),
+    ('compute_area',     'Compute Area',      'Compute area / count statistics for detected features.'),
+    ('extract_coastline','Extract Coastline', 'Extract shoreline geometry from imagery.'),
+    ('generate_report',  'Generate Report',   'Compile findings and evidence into an interactive report.')
+ON CONFLICT (slug) DO NOTHING;
+
+INSERT INTO public.satellite_datasets
+    (slug, name, provider, sensor_type, spatial_resolution_m, revisit_days, earth_engine_id, description) VALUES
+    ('sentinel-2', 'Sentinel-2 MSI', 'copernicus', 'optical', 10, 5,
+        'COPERNICUS/S2_SR_HARMONIZED', 'Optical multispectral; vegetation, coastline, land cover.'),
+    ('sentinel-1', 'Sentinel-1 SAR', 'copernicus', 'sar', 10, 6,
+        'COPERNICUS/S1_GRD', 'C-band SAR; all-weather, flooding and water extent.'),
+    ('landsat-8',  'Landsat 8 OLI',  'usgs', 'optical', 30, 16,
+        'LANDSAT/LC08/C02/T1_L2', 'Optical multispectral; long historical archive.')
+ON CONFLICT (slug) DO NOTHING;
+
+INSERT INTO public.investigation_templates (slug, name, description, default_capabilities) VALUES
+    ('coastline_analysis', 'Coastline Analysis',  'Temporal shoreline change detection.',
+        '["resolve_aoi","retrieve_imagery","cloud_filter","extract_coastline","detect_changes","compute_area","generate_report"]'::jsonb),
+    ('urban_expansion',    'Urban Expansion',     'Detect new built-up area over time.',
+        '["resolve_aoi","retrieve_imagery","cloud_filter","segment_objects","detect_changes","compute_area","generate_report"]'::jsonb),
+    ('flood_assessment',   'Flood Assessment',    'Map flood extent from SAR imagery.',
+        '["resolve_aoi","retrieve_imagery","segment_objects","compute_area","generate_report"]'::jsonb),
+    ('forest_change',      'Forest Change',       'Detect deforestation / forest gain.',
+        '["resolve_aoi","retrieve_imagery","cloud_filter","compute_ndvi","detect_changes","compute_area","generate_report"]'::jsonb),
+    ('agricultural_health','Agricultural Health', 'Assess crop health via vegetation indices.',
+        '["resolve_aoi","retrieve_imagery","cloud_filter","compute_ndvi","compute_area","generate_report"]'::jsonb)
+ON CONFLICT (slug) DO NOTHING;
